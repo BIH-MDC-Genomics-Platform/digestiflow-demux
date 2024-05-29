@@ -1,6 +1,12 @@
 # Central Snakemake for digestiflow_demux.
 
 import os
+import subprocess
+from multiprocessing import Pool
+from typing import List, Tuple
+import argparse
+import toml
+
 
 from digestiflow_demux.snakemake_support import (
     bcl2fastq_wrapper,
@@ -13,10 +19,43 @@ from digestiflow_demux.snakemake_support import (
 )
 
 # -------------------------------------------------------------------------------------------------
+# Command-line arguments
+parser = argparse.ArgumentParser(description="digestiflow-demux")
+parser.add_argument("--config", required=True, help="Path to the configuration file")
+parser.add_argument("--project-uuid", help="Project UUID")
+parser.add_argument("output_dir", help="Output directory path")
+parser.add_argument("input_dirs", nargs='+', help="Input directory paths")
+
+args = parser.parse_args()
+
+# Template configuration file
+config = toml.load(args.config)
+
+
+# Override config with command-line arguments
+if args.project_uuid:
+    config["project_uuid"] = args.project_uuid
+config["output_dir"] = args.output_dir
+config["input_dirs"] = args.input_dirs
+
+# -------------------------------------------------------------------------------------------------
 # Helper Functions
 
-def out_prefix(path):
-    return os.path.join(config["output_dir"], path)
+# def out_prefix(path):
+#     return os.path.join(config["output_dir"], path)
+
+def get_output_path(filename: str) -> str:
+    """Construct the output path based on the given filename."""
+    return os.path.join(config["output_dir"], filename)
+
+
+def create_tar_and_md5sum(params: Tuple[str, str, str]) -> None:
+    """Create a tarball and generate md5sums for bcls and fastq files."""
+    fastq_dir, tar_file, md5_file = params
+    tar_command = f"tar czvf {tar_file} {fastq_dir} ."
+    md5_command = f"md5sum {tar_file} > {md5_file}"
+    subprocess.run(tar_command, shell=True, check=True)
+    subprocess.run(md5_command, shell=True, check=True)
 
 # -------------------------------------------------------------------------------------------------
 # Define local rules.
@@ -27,23 +66,25 @@ localrules: all, marker_file
 # The main rule depends on the "result is complete" file.
 
 rule all:
-    input: out_prefix("DIGESTIFLOW_DEMUX_DONE.txt"),
+    input: get_output_path("DIGESTIFLOW_DEMUX_DONE.txt"),
 
 # -------------------------------------------------------------------------------------------------
 # Create "result is complete" file.
 
+
 @listify
-def marker_file_input(wildcards):
+def marker_file_input(wildcards) -> List[str]:
+    """Generate the list of input files for the marker file."""
     if "seq" in config["delivery_type"]:
-        yield out_prefix("multiqc/multiqc_report.html")
-        yield out_prefix("multiqc/multiqc_data.zip")
-        yield out_prefix(get_tool_marker(config))
+        yield get_output_path("multiqc/multiqc_report.html")
+        yield get_output_path("multiqc/multiqc_data.zip")
+        yield get_output_path(get_tool_marker(config))
     if "bcl" in config["delivery_type"]:
-        yield out_prefix("TARBALLS_DONE.txt")
+        yield get_output_path("TARBALLS_DONE.txt")
 
 rule marker_file:
     input: marker_file_input
-    output: out_prefix("DIGESTIFLOW_DEMUX_DONE.txt"),
+    output: get_output_path("DIGESTIFLOW_DEMUX_DONE.txt"),
     shell:
         r"""
         set -x; date --iso-8601=s >{output}
@@ -53,7 +94,7 @@ rule marker_file:
 # Create lane-wise tarballs of the input.
 
 rule create_tarballs:
-    output: out_prefix("TARBALLS_DONE.txt")
+    output: get_output_path("TARBALLS_DONE.txt")
     shell:
         r"""
         set -x
@@ -99,9 +140,9 @@ rule create_tarballs:
 # Use bcl2fastq for flowcells with rta_version 1
 
 rule demux_bcl2fastq1:
-    input: sheet=out_prefix("SampleSheet.csv")
+    input: sheet=get_output_path("SampleSheet.csv")
     output: get_result_files_demux(config),
-            marker = out_prefix("bcl2fastq1.done")
+            marker = get_output_path("bcl2fastq1.done")
     params:
         flowcell_token=config["flowcell"]["vendor_id"],
         input_dir=config["input_dir"],
@@ -118,9 +159,9 @@ bases_masks = config["flowcell"]["demux_reads_override"]
 keep_undetermined = config["flowcell"]["demux_reads"]
 
 rule demux_bcl2fastq2_aggregate:
-    input: expand(out_prefix("illumina_basesmask/{bases_mask}/bcl2fastq2.done"), bases_mask = bases_masks)
+    input: expand(get_output_path("illumina_basesmask/{bases_mask}/bcl2fastq2.done"), bases_mask = bases_masks)
     output: fastq = get_result_files_demux(config),
-            marker = out_prefix("bcl2fastq2.done")
+            marker = get_output_path("bcl2fastq2.done")
     params:
         keep_undetermined = keep_undetermined,
     run:
@@ -159,8 +200,8 @@ rule demux_bcl2fastq2_aggregate:
             )
 
 rule demux_bcl2fastq2_par:
-    input: sheet = out_prefix("illumina_basesmask/{bases_mask}/SampleSheet.csv")
-    output: marker = out_prefix("illumina_basesmask/{bases_mask}/bcl2fastq2.done")
+    input: sheet = get_output_path("illumina_basesmask/{bases_mask}/SampleSheet.csv")
+    output: marker = get_output_path("illumina_basesmask/{bases_mask}/bcl2fastq2.done")
     params:
         flowcell_token=config["flowcell"]["vendor_id"],
         input_dir=config["input_dir"],
@@ -180,10 +221,10 @@ if not lanes_to_process:
         lanes_to_process |= set(lib["lanes"])
 
 rule demux_picard:
-    input: metrics=expand(out_prefix("picard_barcodes/{lane}/metrics.txt"), lane=lanes_to_process),
-           sheets=expand(out_prefix("picard_barcodes/{lane}/samplesheet.txt"), lane=lanes_to_process)
+    input: metrics=expand(get_output_path("picard_barcodes/{lane}/metrics.txt"), lane=lanes_to_process),
+           sheets=expand(get_output_path("picard_barcodes/{lane}/samplesheet.txt"), lane=lanes_to_process)
     output: get_result_files_demux(config),
-            marker = out_prefix("picard.done")
+            marker = get_output_path("picard.done")
     params:
         machine_name=config["flowcell"]["sequencing_machine"],
         flowcell_token=config["flowcell"]["vendor_id"],
@@ -197,8 +238,8 @@ rule demux_picard:
     wrapper: wrapper_path("picard/basecalls_to_fastq")
 
 rule prepare_picard:
-    input: out_prefix("picard_barcodes/{lane}/barcodes.txt")
-    output: out_prefix("picard_barcodes/{lane}/metrics.txt")
+    input: get_output_path("picard_barcodes/{lane}/barcodes.txt")
+    output: get_output_path("picard_barcodes/{lane}/metrics.txt")
     params:
         flowcell_token=config["flowcell"]["vendor_id"],
         read_structure=config["flowcell"]["demux_reads"],
@@ -211,14 +252,15 @@ rule prepare_picard:
 
 rule fastqc:
     input:
-        fastq=out_prefix("{sample}/{flowcell}/{lane}/{filename}.fastq.gz")
+        fastq=get_output_path("{sample}/{flowcell}/{lane}/{filename}.fastq.gz")
     output:
-        html=out_prefix("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.html"),
-        html_md5=out_prefix("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.html.md5"),
-        zip=out_prefix("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.zip"),
-        zip_md5=out_prefix("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.zip.md5"),
+        html=get_output_path("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.html"),
+        html_md5=get_output_path("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.html.md5"),
+        zip=get_output_path("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.zip"),
+        zip_md5=get_output_path("{sample}/{flowcell}/{lane}/qc/fastqc/{filename}_fastqc.zip.md5"),
     threads: 1
     wrapper: wrapper_path("fastqc")
+
 
 # -------------------------------------------------------------------------------------------------
 # Collect all QC statistics using MultiQC.
@@ -226,7 +268,34 @@ rule fastqc:
 rule illumina_demultiplexing_multiqc:
     input: get_result_files_fastqc(config)["zip"]
     output:
-        html=out_prefix("multiqc/multiqc_report.html"),
-        zip=out_prefix("multiqc/multiqc_data.zip"),
+        html=get_output_path("multiqc/multiqc_report.html"),
+        zip=get_output_path("multiqc/multiqc_data.zip"),
     threads: 1
     wrapper: wrapper_path("multiqc")
+
+
+# -------------------------------------------------------------------------------------------------
+# Create tarballs and md5sums
+
+rule md5_fastq:
+    input:
+        fastq_files=expand(get_output_path("{sample}/{flowcell}/{lane}/{filename}.fastq.gz"), sample=SAMPLES)
+    output:
+        md5_files=expand(get_output_path("{sample}/{flowcell}/{lane}/{filename}.fastq.gz.md5"), sample=SAMPLES)
+    run:
+        for fastq_file in input.fastq_files:
+            md5_file = f"{fastq_file}.md5"
+            shell(f"md5sum {fastq_file} > {md5_file}")
+
+
+rule tar_bcl:
+    input:
+        bcl_files=expand(get_output_path("bcl/{lane}/{filename}.bcl"), lane=[1, 2, 3, 4])
+    output:
+        tar_file=get_output_path("bcls.tar.gz"),
+        md5_file=get_output_path("bcls.tar.gz.md5")
+    run:
+        tar_command = f"tar -czf {output.tar_file} -C {get_output_path('bcl')} ."
+        md5_command = f"md5sum {output.tar_file} > {output.md5_file}"
+        shell(tar_command)
+        shell(md5_command)
